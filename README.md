@@ -1,35 +1,186 @@
-# 庐山派K230手势识别
+# K230 手势识别+人脸检测 按键切换
+# 放在/sdcard/main.py，上电自动跑
+# 之前试过帧级交替但是两个模型冲突了，改成按键切换
 
-这个项目基于立创庐山派K230开发板做的一个手势识别系统。自己拍了300张照片训练了一个YOLO11n模型，部署到板子上跑。
+from libs.PipeLine import PipeLine
+from libs.YOLO import YOLO11
+from libs.AIBase import AIBase
+from libs.AI2D import Ai2d
+from libs.Utils import *
+from media.sensor import *
+import os, gc, time, aidemo
+import nncase_runtime as nn
+import ulab.numpy as np
+from machine import Pin, PWM, FPIOA
 
-## 硬件
+# ==========================================
+# GPIO
+# ==========================================
+fpioa = FPIOA()
+fpioa.set_function(62, FPIOA.GPIO62); fpioa.set_function(20, FPIOA.GPIO20)
+fpioa.set_function(63, FPIOA.GPIO63); fpioa.set_function(43, FPIOA.PWM1)
+fpioa.set_function(53, FPIOA.GPIO53)
 
-- 庐山派K230开发板（立创买的，1G内存版本）
-- GC2093摄像头（赠品）
-- 板子自带的RGB灯、蜂鸣器、按键
-- 本来有个3.1寸MIPI屏幕的但是一直没点亮（可能供电不够）
+LED_R = Pin(62, Pin.OUT, drive=7)
+LED_G = Pin(20, Pin.OUT, drive=7)
+LED_B = Pin(63, Pin.OUT, drive=7)
+buzzer = PWM(1); buzzer.freq(4000)
+BUTTON = Pin(53, Pin.IN, Pin.PULL_DOWN)
+LED_R.value(1); LED_G.value(1); LED_B.value(1); buzzer.duty_u16(0)
 
-## 目前能做什么
+# ==========================================
+# 人脸检测类（独立AIBase，一次只存在一个）
+# ==========================================
+class FaceAI(AIBase):
+    def __init__(self, kmodel_path, anchors, rgb888p_size, display_size):
+        super().__init__(kmodel_path, [320, 320], rgb888p_size, 0)
+        self.conf_thresh = 0.5
+        self.nms_thresh = 0.2
+        self.anchors = anchors
+        self.rgb888p_size = [ALIGN_UP(rgb888p_size[0], 16), rgb888p_size[1]]
+        self.display_size = [ALIGN_UP(display_size[0], 16), display_size[1]]
+        self.ai2d = Ai2d(0)
+        self.ai2d.set_ai2d_dtype(nn.ai2d_format.NCHW_FMT, nn.ai2d_format.NCHW_FMT, np.uint8, np.uint8)
 
-按按键可以在手势识别和人脸检测之间切换
+    def config_pp(self):
+        top, bottom, left, right, _ = letterbox_pad_param(self.rgb888p_size, [320, 320])
+        self.ai2d.pad([0, 0, 0, 0, top, bottom, left, right], 0, [104, 117, 123])
+        self.ai2d.resize(nn.interp_method.tf_bilinear, nn.interp_mode.half_pixel)
+        self.ai2d.build([1, 3, self.rgb888p_size[1], self.rgb888p_size[0]], [1, 3, 320, 320])
 
-手势模式下支持6种手势：
-- 握拳 -> 绿灯亮
-- 张开五指 -> 红灯亮
-- 剪刀手 -> 蓝灯亮
-- 比枪 -> 蜂鸣器叫
-- 竖大拇指 -> 红绿一起亮（黄色）
-- 伸食指 -> 蓝灯+蜂鸣器
+    def postprocess(self, results):
+        ret = aidemo.face_det_post_process(self.conf_thresh, self.nms_thresh, 320, self.anchors, self.rgb888p_size, results)
+        return ret[0] if len(ret) > 0 else []
 
-人脸模式下检测到人脸蜂鸣器会短叫一下。
+# ==========================================
+# 模型管理
+# ==========================================
+GESTURE_LABELS = {0: 'fist', 1: 'five', 2: 'gun', 3: 'one', 4: 'thumbUp', 5: 'yeah'}
+pl = PipeLine(rgb888p_size=[640, 360], display_size=[640, 480], display_mode="virt")
+pl.create(sensor=Sensor(id=2, width=1920, height=1080))
+display_size = pl.get_display_size()
 
-## 怎么做的
+# 人脸锚点
+face_anchors = np.fromfile("/sdcard/examples/utils/prior_data_320.bin", dtype=np.float)
+face_anchors = face_anchors.reshape((4200, 4))
 
-训练用的是01Studio的在线平台，拍了300张手势照片，标注之后训了50轮。精度mAP@0.5大概0.95，板子上跑大概30帧的样子。
+gesture_model = None  # YOLO11
+face_model = None     # FaceAI
+active = "gesture"    # 当前激活
 
-本来想手势和人脸交替推理的，但是两个模型同时加载会冲突，就改成了按键切换模式。后面再想想怎么优化吧。
+# 预加载两个模型
+gesture_model = YOLO11(task_type="detect", mode="video",
+    kmodel_path="/sdcard/yolo11n_det_320.kmodel",
+    labels=GESTURE_LABELS,
+    rgb888p_size=[640, 360], model_input_size=[320, 320],
+    display_size=display_size,
+    conf_thresh=0.6, nms_thresh=0.45, max_boxes_num=50, debug_mode=0)
+gesture_model.config_preprocess()
 
-## 文件说明
+face_model = FaceAI("/sdcard/examples/kmodel/face_detection_320.kmodel",
+                    face_anchors, [640, 360], display_size)
+face_model.config_pp()
 
-- main.py 放在TF卡根目录，上电自动跑
-- yolo11n_det_320.kmodel 训练出来的模型文件（01studio下载的）
+# ==========================================
+# 状态
+# ==========================================
+MODE_GESTURE, MODE_FACE = 0, 1
+mode = MODE_GESTURE
+last_key, pending_key = "?", "?"
+debounce_count = 0
+btn_last = 0
+face_timer = 0
+
+def flash(n):
+    for _ in range(n):
+        LED_R.value(0); LED_G.value(0); LED_B.value(0); time.sleep_ms(30)
+        LED_R.value(1); LED_G.value(1); LED_B.value(1); time.sleep_ms(20)
+
+flash(1)
+print("Gesture mode")
+
+# ==========================================
+# 主循环
+# ==========================================
+while True:
+    os.exitpoint()
+    img = pl.get_frame()
+    if img is None:
+        time.sleep_ms(10)
+        continue
+
+    # ===== 按键 =====
+    btn = BUTTON.value()
+    if btn == 1 and btn_last == 0:
+        mode = 1 - mode
+        active = "gesture" if mode == MODE_GESTURE else "face"
+        flash(mode + 1)
+        last_key = "?"; pending_key = "?"; debounce_count = 0
+        time.sleep_ms(200)  # 等 KPU 切换稳定
+    btn_last = btn
+
+    # ===== 推理 =====
+    key = "?"
+
+    if active == "gesture" and gesture_model:
+        res = gesture_model.run(img)
+        gesture_model.draw_result(res, pl.osd_img)
+        if res and len(res) >= 2 and len(res[0]) > 0:
+            idx, score = res[1][0], res[2][0]
+            name = GESTURE_LABELS.get(idx, "?")
+            if name == "five" and score < 0.75: pass
+            elif name == "gun" and score < 0.65: pass
+            elif name == "one" and score < 0.75: pass
+            elif name == "yeah" and score < 0.75: pass
+            else: key = name
+
+    elif active == "face" and face_model:
+        pl.osd_img.clear()
+        res = face_model.run(img)
+        if res:
+            for det in res:
+                x, y, w, h = map(lambda v: int(round(v, 0)), det[:4])
+                x = x * display_size[0] // 640
+                y = y * display_size[1] // 360
+                w = w * display_size[0] // 640
+                h = h * display_size[1] // 360
+                pl.osd_img.draw_rectangle(x, y, w, h, color=(255, 255, 0, 255), thickness=2)
+            key = "face"
+
+    # ===== 防抖 =====
+    if key == pending_key: debounce_count += 1
+    else: pending_key = key; debounce_count = 1
+
+    if debounce_count >= 2 and pending_key != last_key:
+        LED_R.value(1); LED_G.value(1); LED_B.value(1)
+        if last_key != "face": buzzer.duty_u16(0)
+        k = pending_key
+        if k == "fist": LED_G.value(0)
+        elif k == "five": LED_R.value(0)
+        elif k == "yeah": LED_B.value(0)
+        elif k == "gun": buzzer.duty_u16(32768)
+        elif k == "thumbUp": LED_R.value(0); LED_G.value(0)
+        elif k == "one": LED_B.value(0); buzzer.duty_u16(32768)
+        elif k == "face": buzzer.duty_u16(32768); face_timer = 3
+        last_key = k
+
+    # 人脸短蜂鸣
+    if face_timer > 0:
+        face_timer -= 1
+        if face_timer == 0:
+            buzzer.duty_u16(0)
+
+    # gun 持续蜂鸣
+    if pending_key == "gun" and debounce_count >= 2:
+        buzzer.duty_u16(32768)
+
+    # ===== 显示 =====
+    if active == "gesture":
+        pl.osd_img.draw_string_advanced(10, 10, 28, "Gesture", color=(0,255,0))
+    else:
+        pl.osd_img.draw_string_advanced(10, 10, 28, "Face", color=(0,255,0))
+    pl.osd_img.draw_string_advanced(10, 42, 28, key, color=(255,255,0))
+
+    pl.show_image()
+    gc.collect()
+    time.sleep_ms(5)
