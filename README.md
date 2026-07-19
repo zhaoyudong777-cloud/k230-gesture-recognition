@@ -32,3 +32,11 @@
 
 - main.py 放在TF卡根目录，上电自动跑
 - yolo11n_det_320.kmodel 训练出来的模型文件（01studio下载的）
+## 扩展板
+
+自主设计了PCB扩展板（继电器×2），详见 [pcb_design.md](pcb_design.md) 和 [设计报告.md](设计报告.md)。
+PCB设计文件：[K230_Gesture_Expansion_Board.pdf](K230_Gesture_Expansion_Board.pdf)
+
+## 设计报告
+
+完整设计报告见 [设计报告.md](设计报告.md)
