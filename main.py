@@ -1,7 +1,3 @@
-# K230 手势识别+人脸检测 按键切换
-# 放在/sdcard/main.py，上电自动跑
-# 之前试过帧级交替但是两个模型冲突了，改成按键切换
-
 from libs.PipeLine import PipeLine
 from libs.YOLO import YOLO11
 from libs.AIBase import AIBase
@@ -13,23 +9,38 @@ import nncase_runtime as nn
 import ulab.numpy as np
 from machine import Pin, PWM, FPIOA
 
-# ==========================================
-# GPIO
-# ==========================================
 fpioa = FPIOA()
-fpioa.set_function(62, FPIOA.GPIO62); fpioa.set_function(20, FPIOA.GPIO20)
-fpioa.set_function(63, FPIOA.GPIO63); fpioa.set_function(43, FPIOA.PWM1)
-fpioa.set_function(53, FPIOA.GPIO53)
+# 板载
+fpioa.set_function(62, FPIOA.GPIO62)   # 板载 LED 红
+fpioa.set_function(20, FPIOA.GPIO20)   # 板载 LED 绿
+fpioa.set_function(63, FPIOA.GPIO63)   # 板载 LED 蓝
+fpioa.set_function(43, FPIOA.PWM1)     # 板载蜂鸣器
+# PCB 扩展板
+fpioa.set_function(17, FPIOA.GPIO17)   # PCB 按键
+fpioa.set_function(21, FPIOA.GPIO21)   # PCB LED 绿（继电器2状态）
+fpioa.set_function(47, FPIOA.GPIO47)   # PCB LED 红（继电器1状态）
+fpioa.set_function(42, FPIOA.GPIO42)   # PCB 继电器1
+fpioa.set_function(46, FPIOA.GPIO46)   # PCB 继电器2
 
+# 板载
 LED_R = Pin(62, Pin.OUT, drive=7)
 LED_G = Pin(20, Pin.OUT, drive=7)
 LED_B = Pin(63, Pin.OUT, drive=7)
 buzzer = PWM(1); buzzer.freq(4000)
-BUTTON = Pin(53, Pin.IN, Pin.PULL_DOWN)
+# PCB
+BUTTON = Pin(17, Pin.IN, Pin.PULL_UP)     # 内部上拉，按下=低电平
+RELAY1 = Pin(42, Pin.OUT, drive=7)
+RELAY2 = Pin(46, Pin.OUT, drive=7)
+PCB_LED_R = Pin(47, Pin.OUT, drive=7)     # 继电器1状态灯
+PCB_LED_G = Pin(21, Pin.OUT, drive=7)     # 继电器2状态灯
+
+# 全部初始状态
 LED_R.value(1); LED_G.value(1); LED_B.value(1); buzzer.duty_u16(0)
+RELAY1.value(0); RELAY2.value(0)
+PCB_LED_R.value(0); PCB_LED_G.value(0)
 
 # ==========================================
-# 人脸检测类（独立AIBase，一次只存在一个）
+# 人脸检测
 # ==========================================
 class FaceAI(AIBase):
     def __init__(self, kmodel_path, anchors, rgb888p_size, display_size):
@@ -88,7 +99,7 @@ MODE_GESTURE, MODE_FACE = 0, 1
 mode = MODE_GESTURE
 last_key, pending_key = "?", "?"
 debounce_count = 0
-btn_last = 0
+btn_last = 1  # PULL_UP 模式下未按下=高电平
 face_timer = 0
 
 def flash(n):
@@ -111,7 +122,7 @@ while True:
 
     # ===== 按键 =====
     btn = BUTTON.value()
-    if btn == 1 and btn_last == 0:
+    if btn == 0 and btn_last == 1:
         mode = 1 - mode
         active = "gesture" if mode == MODE_GESTURE else "face"
         flash(mode + 1)
@@ -128,10 +139,10 @@ while True:
         if res and len(res) >= 2 and len(res[0]) > 0:
             idx, score = res[1][0], res[2][0]
             name = GESTURE_LABELS.get(idx, "?")
-            if name == "five" and score < 0.75: pass
-            elif name == "gun" and score < 0.65: pass
-            elif name == "one" and score < 0.75: pass
-            elif name == "yeah" and score < 0.75: pass
+            if name == "five" and score < 0.60: pass
+            elif name == "gun" and score < 0.55: pass
+            elif name == "one" and score < 0.80: pass
+            elif name == "yeah" and score < 0.60: pass
             else: key = name
 
     elif active == "face" and face_model:
@@ -151,13 +162,17 @@ while True:
     if key == pending_key: debounce_count += 1
     else: pending_key = key; debounce_count = 1
 
-    if debounce_count >= 2 and pending_key != last_key:
+    if debounce_count >= 1 and pending_key != last_key:
         LED_R.value(1); LED_G.value(1); LED_B.value(1)
+        RELAY1.value(0); RELAY2.value(0); PCB_LED_R.value(0); PCB_LED_G.value(0)
         if last_key != "face": buzzer.duty_u16(0)
         k = pending_key
-        if k == "fist": LED_G.value(0)
-        elif k == "five": LED_R.value(0)
-        elif k == "yeah": LED_B.value(0)
+        if k == "fist":
+            LED_G.value(0); RELAY1.value(1); PCB_LED_R.value(1)
+        elif k == "five":
+            LED_R.value(0); RELAY2.value(1); PCB_LED_G.value(1)
+        elif k == "yeah":
+            LED_B.value(0); RELAY1.value(0); RELAY2.value(0)
         elif k == "gun": buzzer.duty_u16(32768)
         elif k == "thumbUp": LED_R.value(0); LED_G.value(0)
         elif k == "one": LED_B.value(0); buzzer.duty_u16(32768)
@@ -171,8 +186,13 @@ while True:
             buzzer.duty_u16(0)
 
     # gun 持续蜂鸣
-    if pending_key == "gun" and debounce_count >= 2:
+    if pending_key == "gun" and debounce_count >= 1:
         buzzer.duty_u16(32768)
+    # 继电器保持（没检测到其他手势时保持）
+    if pending_key == "fist" and debounce_count >= 1:
+        RELAY1.value(1); PCB_LED_R.value(1)
+    if pending_key == "five" and debounce_count >= 1:
+        RELAY2.value(1); PCB_LED_G.value(1)
 
     # ===== 显示 =====
     if active == "gesture":
